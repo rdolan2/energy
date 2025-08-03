@@ -1,0 +1,187 @@
+---
+title: "Has Our Electricity Usage Changed Since June 2024?"
+date: "`r Sys.Date()`"
+output: 
+  xaringan::moon_reader:
+    lib_dir: libs
+    nature:
+      highlightStyle: github
+      highlightLines: true
+      countIncrementalSlides: false
+      ratio: '16:9'
+---
+
+```{r setup, include=FALSE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+```
+
+```{r include=FALSE, echo=FALSE}
+library(tidyverse)
+library(lubridate)
+library(gt)
+library(scales)
+# Load your cleaned data
+daily_usage <- read_csv("/home/rstudio/output/daily_usage.csv")
+t_test_results <- read_csv("/home/rstudio/output/t_test_results.csv")
+model_summary <- read_csv("/home/rstudio/output/model_summary.csv")
+```
+
+# Data Overview
+
+- Time range: Oct 2023 – July 2025
+- Frequency: Half-hour readings aggregated to daily totals
+- Metric: kWh used per day
+
+---
+# Initial Insight (Raw Comparison)
+
+```{r, echo=FALSE, fig.width=15}
+ggplot(daily_usage %>% 
+         filter(!Month %in% c("June", "July", "August", "September")),
+       aes(x = fct_rev(DayOfWeekShort), y = Daily_kWh, fill = Period)) +
+  geom_boxplot() +
+  facet_wrap(~Month) +
+  labs(title = "Electricity Usage by Weekday (Unadjusted)",
+       x = "Day of Week", y = "Daily Usage (kWh)") +
+  theme_minimal() +
+  coord_flip()
+```
+
+---
+# Seasonality Observed
+
+```{r, echo=FALSE, fig.width=7}
+daily_usage %>% 
+  group_by(Month) %>% 
+  summarise(mean_kWh = mean(Daily_kWh)) %>% 
+  ggplot(aes(x = Month, y = mean_kWh)) +
+  geom_col(fill = "steelblue") +
+  labs(title = "Average Daily Usage by Month",
+       x = "Month", y = "Mean Daily kWh") +
+  theme_minimal()
+
+ggplot(daily_usage, aes(x = Date, y = Daily_kWh)) +
+  geom_line(alpha = 0.3) +
+  geom_smooth(method = "loess", span = 0.2, se = TRUE, color = "blue") +
+  geom_vline(xintercept = as.Date("2024-06-01"), linetype = "dashed", color = "red") +
+  labs(title = "Daily Electricity Usage Over Time",
+       subtitle = "LOESS smoothed trend with June 1, 2024 cutoff",
+       y = "Daily kWh", x = "Date") +
+  theme_minimal()
+```
+
+
+---
+# Adjusting for Seasonality: Linear Model
+
+```{r, echo=FALSE}
+model_summary %>%
+  filter(term == "PeriodAfter June 2024") %>%
+  gt() %>%
+  fmt_number(columns = everything(), decimals = 3) %>%
+  tab_header(
+    title = "Effect of Period After June 2024 (Adjusted for Seasonality)"
+  )
+
+daily_usage <- daily_usage %>%
+  mutate(
+    Period = factor(Period, levels = c("Before June 2024", "After June 2024")),
+    DayOfWeek = factor(DayOfWeek, 
+                       levels = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"))
+  )
+
+# Fit the model (if not already done)
+model_by_day <- lm(Daily_kWh ~ Period * DayOfWeek + Month, data = daily_usage)
+
+# Get tidy summary with confidence intervals
+model_by_day_summary <- broom::tidy(model_by_day, conf.int = TRUE)
+
+# Filter relevant terms: main Period effect (Monday) + Period:DayOfWeek interactions
+did_terms <- model_by_day_summary %>%
+  filter(str_detect(term, "PeriodAfter June 2024:DayOfWeek") | term == "PeriodAfter June 2024") %>%
+  mutate(
+    DayOfWeek = case_when(
+      term == "PeriodAfter June 2024" ~ "Monday",
+      TRUE ~ str_remove(term, "PeriodAfter June 2024:DayOfWeek")
+    )
+  )
+
+# Extract Monday’s row (main Period effect)
+monday_row <- did_terms %>% filter(DayOfWeek == "Monday")
+
+# Calculate absolute estimates for each day by adding Monday's estimate to other days
+did_terms_abs <- did_terms %>%
+  mutate(
+    estimate = if_else(DayOfWeek == "Monday", estimate, estimate + monday_row$estimate),
+    term = DayOfWeek  # replace term with day names for clarity
+  ) %>%
+  select(term, estimate, std.error, statistic, p.value, conf.low, conf.high) %>%
+  arrange(factor(term, levels = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")))
+
+# Format and display as a gt table
+did_terms_abs %>%
+  gt() %>%
+  fmt_number(
+    columns = vars(estimate, std.error, statistic, p.value, conf.low, conf.high),
+    decimals = 3
+  ) %>%
+  tab_header(
+    title = "Estimated Energy Change After June 2024 by Weekday"
+  ) %>%
+  cols_label(
+    term = "Day of Week",
+    estimate = "estimate",
+    std.error = "std.error",
+    statistic = "statistic",
+    p.value = "p-value",
+    conf.low = "conf.low",
+    conf.high = "conf.high"
+  )
+```
+
+---
+# In the above tables:
+- Estimate is the change in kWh usage.
+- std.error is the amount the estimate varies.
+- p-value is the significance. If the p-value is less than 0.05 the estimate is statistically significant.
+- We can have 95% confidence that the energy consumption change is between conf.low and conf.high
+---
+# Difference-in-Differences
+
+```{r, echo=FALSE, fig.width=7}
+daily_usage %>% 
+  filter(!Month %in% c("June", "July", "August", "September")) %>% 
+  mutate(DayOfWeekShort = factor(DayOfWeekShort, 
+                                 levels = c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"))) %>% 
+  group_by(Period, DayOfWeekShort) %>% 
+  summarise(mean_kWh = mean(Daily_kWh), .groups = 'drop') %>% 
+  ggplot(aes(x = DayOfWeekShort, y = mean_kWh, color = Period, group = Period)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  labs(title = "Daily Usage Before vs. After June 2024",
+       x = "Day of Week", y = "Average Daily kWh") +
+  theme_minimal()
+
+filtered_data <- daily_usage %>%
+  filter(!Month %in% c("June", "July", "August", "September"))
+
+ggplot(filtered_data, aes(x = Period, y = Daily_kWh, fill = Period)) +
+  stat_summary(fun = mean, geom = "bar", width = 0.5) +
+  stat_summary(fun.data = mean_cl_normal, geom = "errorbar", width = 0.2) +
+  labs(
+    title = "Adjusted Comparison of Average Daily Usage (Excludes June–Sept)",
+    y = "Daily kWh",
+    x = "Period"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+
+---
+# Summary of Findings
+
+- 📈 After adjusting for seasonality, usage increased by **3.2 kWh/day**
+- 📊 Saturday showed highest post-June increase
+- To accurately say the annual difference in energy consumption we would need more data.
+- A quick "back-of-the-napkin" estimate for annual change is a 1,170 kWh increase (3.205 kWh x 365 days).
